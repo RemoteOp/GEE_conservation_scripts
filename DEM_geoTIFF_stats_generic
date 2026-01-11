@@ -107,9 +107,10 @@ Export.image.toDrive({
   description: output_prefix + '_AOI',
   fileNamePrefix: output_prefix + '_AOI',
   region: AOI_geometry,
-  scale: 30,
+  scale: 30,                  // NASADEM native resolution
   maxPixels: 1e13,
   fileFormat: 'GeoTIFF',
+  crs: 'EPSG:4326', 
   formatOptions: {cloudOptimized: true}
 });
 
@@ -122,6 +123,7 @@ Export.image.toDrive({
   scale: 30,
   maxPixels: 1e13,
   fileFormat: 'GeoTIFF',
+  crs: 'EPSG:4326', 
   formatOptions: {cloudOptimized: true}
 });
 
