@@ -1,0 +1,228 @@
+// ======================================================================
+//  CHIRPS Rainfall Analysis — GENERIC VERSION
+// ======================================================================
+
+// ======================================================================
+// USER SETTINGS (edit these)
+// ======================================================================
+
+var country_name = 'Kenya';  // Change to your country
+
+// Study period  
+var study_start = '2023-03-01';    
+var study_end   = '2023-05-31';
+
+// Baseline period
+var baseline_start_year = 2000;
+var baseline_end_year   = 2015;
+
+// Day of year range (for seasonal analysis)
+// Date calculator: https://www.timeanddate.com/date/dateadded.html?d1=01&m1=01&y1=1990&type=add&ay=&am=&aw=&ad=1&rec=
+var doy_start = 60;   // March 1
+var doy_end   = 151;  // May 31
+
+// Output prefix (all exports will use this)
+var output_prefix = 'Rainfall_' + country_name;
+
+// Protected area designations to include
+var allowedDesigs = [
+  'National Park',
+  'National Reserve',
+  'Forest Reserve',
+  'Nature Reserve',
+  'National Sanctuary',
+  'Wildlife Sanctuary',
+  'UNESCO-MAB Biosphere Reserve'
+];
+
+// ======================================================================
+// LOAD AOI & PROTECTED AREAS
+// ======================================================================
+
+// Load country boundary (LSIB dataset)
+var AOI = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
+  .filter(ee.Filter.eq('country_na', country_name));
+
+var AOIgeom = AOI.geometry();  
+
+// Filter WDPA by designation + intersection with country
+var PA = ee.FeatureCollection("WCMC/WDPA/current/polygons")
+  .filter(ee.Filter.inList('DESIG_ENG', allowedDesigs))
+  .map(function(f){ 
+    return f.set('intersects', f.geometry().intersects(AOIgeom, 1));
+  })
+  .filter(ee.Filter.eq('intersects', true));
+  
+var PA_polygons = PA.map(function(f){
+  var geomType = f.geometry().type();
+  return f.set('geometry_type', geomType);
+})
+.filter(ee.Filter.inList('geometry_type', ['Polygon', 'MultiPolygon']));
+
+print("Country:", country_name);
+print("Number of Protected Areas (PA):", PA.size());
+
+// ======================================================================
+// MAP STYLE LAYERS
+// ======================================================================
+
+var AOIVis = AOI.style({
+  color: "FF4500",
+  width: 1,
+  fillColor: "FFFFFF00"
+});
+
+var PAVis = PA.style({
+  color: "006400",
+  width: 1,
+  fillColor: "FFFFFF00"
+});
+
+Map.centerObject(AOI, 7);
+Map.addLayer(AOIVis, {}, country_name + " (AOI)");
+Map.addLayer(PAVis, {}, "Protected Areas (PA)");
+
+// ======================================================================
+// TEMPORAL REDUCERS — CHIRPS DAILY RAINFALL
+// ======================================================================
+
+var chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+  .select('precipitation')
+  .filterBounds(AOIgeom);
+
+print("Study period:", study_start, "to", study_end);
+print("Baseline period:", baseline_start_year, "to", baseline_end_year);
+
+// ======================================================================
+// 1. Total rainfall during study period
+// ======================================================================
+
+var chirps_study = chirps
+  .filter(ee.Filter.date(study_start, study_end))
+  .sum()
+  .clip(AOIgeom);
+
+Map.addLayer(chirps_study, {
+  min: 50, max: 600,
+  palette: ['#f1eef6', '#bdc9e1', '#74a9cf', '#2b8cbe', '#045a8d']
+}, 'Total precipitation (Study period)');
+
+// ======================================================================
+// 2. Baseline rainfall (mean total for season across baseline years)
+// ======================================================================
+
+var chirps_mam = chirps.filter(ee.Filter.dayOfYear(doy_start, doy_end));
+var years = ee.List.sequence(baseline_start_year, baseline_end_year);
+
+var chirps_baseline = ee.ImageCollection.fromImages(
+  years.map(function (y) {
+    return chirps_mam
+      .filter(ee.Filter.calendarRange(y, y, 'year'))
+      .sum()
+      .clip(AOIgeom)
+      .set('year', y);
+  })
+).mean();
+
+Map.addLayer(chirps_baseline, {
+  min: 50, max: 600,
+  palette: ['#f1eef6', '#bdc9e1', '#74a9cf', '#2b8cbe', '#045a8d']
+}, 'Baseline avg precipitation (' + baseline_start_year + '–' + baseline_end_year + ')');
+
+// ======================================================================
+// 3. Rainfall anomaly
+// ======================================================================
+
+var baseline_masked = chirps_baseline.updateMask(chirps_study.mask());
+
+var rainfall_anomaly = chirps_study
+  .subtract(baseline_masked)
+  .clip(AOIgeom);
+
+var anomalyVis = {
+  min: -300,
+  max: 300,
+  palette: ['#67001f','#b2182b','#d6604d','#f4a582','#fddbc7',
+            '#e0e0e0',
+            '#d1e5f0','#92c5de','#4393c3','#2166ac','#053061']
+};
+
+Map.addLayer(rainfall_anomaly, anomalyVis, 'Rainfall anomaly (Study vs Baseline)');
+
+// ======================================================================
+// SPATIAL REDUCERS — Rainfall stats for each Protected Area (PA)
+// ======================================================================
+
+var reducers_all = ee.Reducer.mean()
+  .combine(ee.Reducer.min(), null, true)
+  .combine(ee.Reducer.max(), null, true);
+
+var pa_stats = chirps_study.reduceRegions({
+  collection: PA,
+  reducer: reducers_all,
+  scale: 5000
+});
+
+// Remove empty rows
+var pa_stats_clean = pa_stats.filter(ee.Filter.notNull(['mean']));
+
+// Add centroid coordinates for QGIS labeling
+var pa_stats_with_centroid = pa_stats_clean.map(function(f) {
+  var centroid = f.geometry().centroid(1);
+  var lon = centroid.coordinates().get(0);
+  var lat = centroid.coordinates().get(1);
+  return f.set({
+    'longitude': lon,
+    'latitude': lat
+  });
+});
+
+print("Clean PA stats + coords:", pa_stats_with_centroid);
+
+// ======================================================================
+// EXPORTS (using output_prefix)
+// ======================================================================
+
+Export.image.toDrive({
+  image: chirps_study,
+  description: output_prefix + '_StudyPeriod',
+  fileNamePrefix: output_prefix + '_StudyPeriod',
+  region: AOIgeom,
+  scale: 5000,
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: chirps_baseline,
+  description: output_prefix + '_Baseline_' + baseline_start_year + '_' + baseline_end_year,
+  fileNamePrefix: output_prefix + '_Baseline_' + baseline_start_year + '_' + baseline_end_year,
+  region: AOIgeom,
+  scale: 5000,
+  maxPixels: 1e13
+});
+
+Export.table.toDrive({
+  collection: pa_stats_with_centroid,
+  description: output_prefix + '_PA_Stats',
+  fileNamePrefix: output_prefix + '_PA_Stats',
+  fileFormat: 'CSV',
+  selectors: ['NAME', 'DESIG_ENG', 'longitude', 'latitude', 'mean', 'min', 'max']
+});
+
+Export.table.toDrive({
+  collection: PA_polygons,
+  description: output_prefix + '_PA_Polygons',
+  fileNamePrefix: output_prefix + '_PA_Polygons',
+  fileFormat: 'SHP'
+});
+
+Export.image.toDrive({
+  image: rainfall_anomaly,
+  description: output_prefix + '_Anomaly',
+  fileNamePrefix: output_prefix + '_Anomaly',
+  region: AOIgeom,
+  scale: 5000,
+  maxPixels: 1e13
+});
+
+print("All exports queued with prefix:", output_prefix);
